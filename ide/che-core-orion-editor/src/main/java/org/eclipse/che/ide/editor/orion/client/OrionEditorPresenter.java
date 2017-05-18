@@ -81,8 +81,6 @@ import org.eclipse.che.ide.api.editor.position.PositionConverter;
 import org.eclipse.che.ide.api.editor.quickfix.QuickAssistAssistant;
 import org.eclipse.che.ide.api.editor.quickfix.QuickAssistProcessor;
 import org.eclipse.che.ide.api.editor.quickfix.QuickAssistantFactory;
-import org.eclipse.che.ide.api.editor.reconciler.Reconciler;
-import org.eclipse.che.ide.api.editor.reconciler.ReconcilerWithAutoSave;
 import org.eclipse.che.ide.api.editor.signature.SignatureHelp;
 import org.eclipse.che.ide.api.editor.signature.SignatureHelpProvider;
 import org.eclipse.che.ide.api.editor.text.LinearRange;
@@ -125,6 +123,7 @@ import org.eclipse.che.ide.editor.orion.client.menu.EditorContextMenu;
 import org.eclipse.che.ide.editor.orion.client.signature.SignatureHelpView;
 import org.eclipse.che.ide.part.editor.multipart.EditorMultiPartStackPresenter;
 import org.eclipse.che.ide.resource.Path;
+import org.eclipse.che.ide.util.loging.Log;
 import org.vectomatic.dom.svg.ui.SVGResource;
 
 import javax.validation.constraints.NotNull;
@@ -185,6 +184,7 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
     private final AppContext                             appContext;
     private final SignatureHelpView                      signatureHelpView;
     private final EditorContextMenu                      contextMenu;
+    private final AutoSaveMode                           autoSaveMode;
     private final ClientServerEventService               clientServerEventService;
 
     private final AnnotationRendering rendering = new AnnotationRendering();
@@ -226,6 +226,7 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
                                 final AppContext appContext,
                                 final SignatureHelpView signatureHelpView,
                                 final EditorContextMenu contextMenu,
+                                final AutoSaveMode autoSaveMode,
                                 final ClientServerEventService clientServerEventService) {
         this.codeAssistantFactory = codeAssistantFactory;
         this.deletedFilesController = deletedFilesController;
@@ -247,6 +248,7 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
         this.appContext = appContext;
         this.signatureHelpView = signatureHelpView;
         this.contextMenu = contextMenu;
+        this.autoSaveMode = autoSaveMode;
         this.clientServerEventService = clientServerEventService;
 
         keyBindingsManager = new TemporaryKeyBindingsManager();
@@ -262,7 +264,8 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
             quickAssistant.setQuickAssistProcessor(processor);
         }
 
-        editorInit = new OrionEditorInit(configuration,
+        editorInit = new OrionEditorInit(autoSaveMode,
+                                         configuration,
                                          this.codeAssistantFactory,
                                          this.quickAssistant,
                                          this);
@@ -428,6 +431,7 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
     }
 
     private void updateContent() {
+        Log.error(getClass(), "-- fire FileContentUpdateEvent " + document.getFile().getLocation().toString());
         generalEventBus.fireEvent(new FileContentUpdateEvent(document.getFile().getLocation().toString()));
     }
 
@@ -474,6 +478,11 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
 
     @Override
     public void close(boolean save) {
+        if (resourceChangeHandler != null) {
+            resourceChangeHandler.removeHandler();
+            resourceChangeHandler = null;
+        }
+
         this.documentStorage.documentClosed(this.document);
         editorInit.uninstall();
         workspaceAgent.removePart(this);
@@ -505,7 +514,8 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
     }
 
     @Override
-    public void onClose(@NotNull final AsyncCallback<Void> callback) {
+    public void onClosing(@NotNull final AsyncCallback<Void> callback) {
+        Log.error(getClass(), "------ onClosing");
         if (isDirty()) {
             dialogFactory.createConfirmDialog(
                     constant.askWindowCloseTitle(),
@@ -514,30 +524,18 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
                         @Override
                         public void accepted() {
                             doSave();
-                            handleClose();
                             callback.onSuccess(null);
                         }
                     },
                     new CancelCallback() {
                         @Override
                         public void cancelled() {
-                            handleClose();
                             callback.onSuccess(null);
                         }
                     }).show();
         } else {
-            handleClose();
             callback.onSuccess(null);
         }
-    }
-
-    @Override
-    protected void handleClose() {
-        if (resourceChangeHandler != null) {
-            resourceChangeHandler.removeHandler();
-            resourceChangeHandler = null;
-        }
-        super.handleClose();
     }
 
     @Override
@@ -604,6 +602,7 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
         this.documentStorage.saveDocument(getEditorInput(), this.document, false, new AsyncCallback<EditorInput>() {
             @Override
             public void onSuccess(EditorInput editorInput) {
+                Log.error(getClass(), "////////////////////////// save document success");
                 updateDirtyState(false);
                 editorWidget.markClean();
                 afterSave();
@@ -804,7 +803,7 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
     public void editorLostFocus() {
         this.editorView.updateInfoPanelUnfocused(this.document.getLineCount());
         this.isFocused = false;
-        if (isDirty()) {
+        if (isDirty() && autoSaveMode.isActivated()) {
             doSave();
         }
     }
@@ -905,33 +904,17 @@ public class OrionEditorPresenter extends AbstractEditorPresenter implements Tex
 
     @Override
     public boolean isAutoSaveEnabled() {
-        ReconcilerWithAutoSave autoSave = getAutoSave();
-        return autoSave != null && autoSave.isAutoSaveEnabled();
-    }
-
-    private ReconcilerWithAutoSave getAutoSave() {
-        Reconciler reconciler = getConfiguration().getReconciler();
-
-        if (reconciler != null && reconciler instanceof ReconcilerWithAutoSave) {
-            return ((ReconcilerWithAutoSave)reconciler);
-        }
-        return null;
+        return autoSaveMode.isActivated();
     }
 
     @Override
     public void enableAutoSave() {
-        ReconcilerWithAutoSave autoSave = getAutoSave();
-        if (autoSave != null) {
-            autoSave.enableAutoSave();
-        }
+        autoSaveMode.resume();
     }
 
     @Override
     public void disableAutoSave() {
-        ReconcilerWithAutoSave autoSave = getAutoSave();
-        if (autoSave != null) {
-            autoSave.disableAutoSave();
-        }
+        autoSaveMode.suspend();
     }
 
     @Override
